@@ -48,6 +48,7 @@ def main():
 
 def create_miami_plot(dfs, pos_max, rel_start, args):
     # Creating the figure and axe
+    logger.info("Generating the miami plot")
     figure, axe = plt.subplots(
         1, 1, figsize=(args.graph_width, args.graph_height),
     )
@@ -238,11 +239,12 @@ def find_chrom_relative_start(df1, df2, args):
         if chrom != 1:
             # Finding the previous chromosome
             previous_chrom = chrom - 1
-            while previous_chrom not in chrom_max or previous_chrom == 0:
+            while previous_chrom not in chrom_max and previous_chrom > 1:
                 previous_chrom -= 1
 
             relative_start[chrom] = (
-                relative_start[previous_chrom] + chrom_max[previous_chrom] +
+                relative_start[previous_chrom] +
+                chrom_max.get(previous_chrom, 0) +
                 args.chromosome_spacing
             )
 
@@ -260,6 +262,7 @@ def read_data(args):
     # Dataset is in a single file
     if args.data is not None:
         # We need the group column
+        logger.info(f"Reading '{args.data}'")
         cols.append(args.strata)
 
         # Reading the file
@@ -291,6 +294,7 @@ def read_data(args):
     # There is two datasets
     else:
         # Reading the first file
+        logger.info(f"Reading '{args.up_data}'")
         try:
             df_1 = pd.read_csv(args.up_data, sep=args.sep, low_memory=False,
                                usecols=cols)
@@ -299,6 +303,7 @@ def read_data(args):
             sys.exit(1)
 
         # Reading the second file
+        logger.info(f"Reading '{args.down_data}'")
         try:
             df_2 = pd.read_csv(args.down_data, sep=args.sep, low_memory=False,
                                usecols=cols)
