@@ -2,6 +2,7 @@
 
 
 import sys
+from typing import Tuple
 import logging
 import argparse
 from os import path
@@ -53,12 +54,15 @@ def create_miami_plot(dfs, pos_max, rel_start, args):
         1, 1, figsize=(args.graph_width, args.graph_height),
     )
 
+    # Join the two datasets and find the dataset specific variants if needed.
+    if args.show_dataset_specific_variants:
+        dfs = check_significance_in_datasets(*dfs, args)
+
     # Plotting the upper part
-    plot_group(dfs[0], rel_start, axe, args, colors=args.up_colors)
+    plot_group(dfs[0], rel_start, axe, args, up=True)
 
     # Plotting the lower part
-    plot_group(dfs[1], rel_start, axe, args, colors=args.down_colors,
-               multiplier=1)
+    plot_group(dfs[1], rel_start, axe, args, up=False)
 
     # Adding the boxes around the even chromosomes
     add_plot_boxes(pos_max, rel_start, axe, args)
@@ -178,7 +182,14 @@ def find_chrom_box_start_end(pos_max, rel_start, padding=0):
     return relative_pos_min, relative_pos_max
 
 
-def plot_group(df, rel_start, axe, args, colors, multiplier=-1):
+def plot_group(df, rel_start, axe, args, up):
+    if up:
+        multiplier = -1
+        colors = args.up_colors
+    else:
+        multiplier = 1
+        colors = args.down_colors
+
     # Plotting per chromosome
     for chrom_i, (chrom, df) in enumerate(df.groupby(args.chrom, sort=True)):
         # Encoding the chromosome
@@ -197,26 +208,83 @@ def plot_group(df, rel_start, axe, args, colors, multiplier=-1):
                 (np.random.random(size=df.shape[0]) < args.p_sampling_prop), :
             ]
 
-        # Plotting the normal points
+        if args.show_dataset_specific_variants:
+            scatter_with_dataset_specific_significance(
+                df, rel_start, axe, args, colors, multiplier, chrom, chrom_i
+            )
+        else:
+            scatter_standard(
+                df, rel_start, axe, args, colors, multiplier, chrom, chrom_i
+            )
+
+
+def scatter_with_dataset_specific_significance(
+    df, rel_start, axe, args, colors, multiplier, chrom, chrom_i
+):
+    doing_dataset_1 = (multiplier == -1)
+
+    markers = {
+        "NON_SIGNIFICANT": "o",
+        "1_ONLY": "^",
+        "2_ONLY": "v",
+        "BOTH": "o",
+    }
+
+    for level, marker in markers.items():
+        color = colors[0] if (chrom_i + 1) % 2 == 1 else colors[1]
+
+        if (level == "NON_SIGNIFICANT"):
+            # The variant is not significant anywhere, we use default color and
+            # size.
+            s = args.point_size
+
+        elif (
+            ((doing_dataset_1) and level == "2_ONLY") or
+            ((not doing_dataset_1) and level == "1_ONLY")
+        ):
+            # The is significant in the other dataset only.
+            # We use the regular color, but still make the marker larger to
+            # make sure that it is visible.
+            s = args.significant_point_size
+
+        else:
+            # The variant is significant in the current dataset.
+            s = args.significant_point_size
+            color = args.significant_color
+
+        cur = df.loc[df.significance == level, :]
         axe.scatter(
-            df.loc[:, args.pos] + rel_start[chrom],
-            (np.log10(df.loc[:, args.p])) * multiplier,
-            s=args.point_size,
-            c=colors[0] if (chrom_i + 1) % 2 == 1 else colors[1],
-            zorder=3,
+            cur[args.pos] + rel_start[chrom],
+            (np.log10(cur[args.p])) * multiplier,
+            s=s,
+            marker=marker,
+            c=color,
+            zorder=3
         )
 
-        # Plotting the significant points
-        sig_points = df.loc[
-            df.loc[:, args.p] < args.significant_threshold, :
-        ]
-        axe.scatter(
-            sig_points.loc[:, args.pos] + rel_start[chrom],
-            (np.log10(sig_points.loc[:, args.p])) * multiplier,
-            s=args.significant_point_size,
-            c=args.significant_color,
-            zorder=3,
-        )
+
+def scatter_standard(df, rel_start, axe, args, colors, multiplier, chrom,
+                     chrom_i):
+    # Plotting the normal points
+    axe.scatter(
+        df.loc[:, args.pos] + rel_start[chrom],
+        (np.log10(df.loc[:, args.p])) * multiplier,
+        s=args.point_size,
+        c=colors[0] if (chrom_i + 1) % 2 == 1 else colors[1],
+        zorder=3,
+    )
+
+    # Plotting the significant points
+    sig_points = df.loc[
+        df.loc[:, args.p] < args.significant_threshold, :
+    ]
+    axe.scatter(
+        sig_points.loc[:, args.pos] + rel_start[chrom],
+        (np.log10(sig_points.loc[:, args.p])) * multiplier,
+        s=args.significant_point_size,
+        c=args.significant_color,
+        zorder=3,
+    )
 
 
 def find_chrom_relative_start(df1, df2, args):
@@ -251,13 +319,15 @@ def find_chrom_relative_start(df1, df2, args):
     return chrom_max, relative_start
 
 
-def read_data(args):
+def read_data(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
     # The up and down dataset
     df_1 = None
     df_2 = None
 
     # The column to read (to speed up the IO)
     cols = [args.chrom, args.pos, args.p]
+    if args.show_dataset_specific_variants:
+        cols.extend([args.other_allele, args.effect_allele])
 
     # Dataset is in a single file
     if args.data is not None:
@@ -291,7 +361,7 @@ def read_data(args):
         if args.down_data_label is None:
             args.down_data_label = unique_group[1]
 
-    # There is two datasets
+    # There are two datasets
     else:
         # Reading the first file
         logger.info(f"Reading '{args.up_data}'")
@@ -312,6 +382,67 @@ def read_data(args):
             sys.exit(1)
 
     return df_1, df_2
+
+
+def check_significance_in_datasets(
+    df1,
+    df2,
+    args
+) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Checks significance of variants in the two datasets after joining.
+
+    The returned series contains factors with levels:
+        - 1_ONLY
+        - 2_ONLY
+        - BOTH
+        - NON_SIGNIFICANT
+
+    """
+    # Create unique identifiers for variants to allow joining.
+    def _create_id(df) -> pd.Series:
+        alleles_df = df[[args.other_allele, args.effect_allele]]\
+            .astype(str)
+
+        return (
+            df[args.chrom].astype(str) + ":" +
+            df[args.pos].astype(str) + "_" +
+            alleles_df.min(axis=1) + "/" +
+            alleles_df.max(axis=1)
+        )
+
+    threshold = -np.log10(args.significant_threshold)
+
+    df1["_id"] = _create_id(df1)
+    df2["_id"] = _create_id(df2)
+
+    # Compute -log10(p) for both datasets.
+    df1["nlogp_1"] = -np.log10(df1[args.p])
+    df2["nlogp_2"] = -np.log10(df2[args.p])
+
+    merged = pd.merge(df1, df2, how="outer", on="_id")
+
+    # Check the different possible types of significance.
+    sig_1 = merged.nlogp_1 > threshold
+    sig_2 = merged.nlogp_2 > threshold
+    sig_both = sig_1 & sig_2
+    sig_1_only = sig_1 & (~sig_2)
+    sig_2_only = sig_2 & (~sig_1)
+    ns = (~sig_1) & (~sig_2)
+
+    significance_df = pd.DataFrame({
+        "BOTH": sig_both,
+        "1_ONLY": sig_1_only,
+        "2_ONLY": sig_2_only,
+        "NON_SIGNIFICANT": ns
+    })
+
+    merged["significance"] = significance_df.idxmax(axis=1).astype("category")
+    merged = merged[["_id", "significance"]]
+
+    return (
+        pd.merge(df1, merged, how="left", on="_id"),
+        pd.merge(df2, merged, how="left", on="_id"),
+    )
 
 
 def chrom_as_int(chrom):
@@ -376,6 +507,18 @@ def check_args(args):
     elif args.significant_threshold not in args.abline:
         args.abline.append(args.significant_threshold)
 
+    # Check that both alleles are provided if show_dataset_specific_variants
+    # is requested.
+    if args.show_dataset_specific_variants:
+        if args.other_allele == "" or args.effect_allele == "":
+            logger.error(
+                "Need to provide columns for alleles (--effect-allele and "
+                "--other-allele) when the --show-dataset-specific-variants "
+                "option is enabled. This is needed to ensure that the same "
+                "variants (same alleles) are compared across both datasets."
+            )
+            sys.exit(1)
+
 
 def parse_args():
     parser = argparse.ArgumentParser(
@@ -424,6 +567,16 @@ def parse_args():
     group.add_argument(
         "--position", type=str, metavar="POS", default="pos", dest="pos",
         help="The column containing the positions. [%(default)s]",
+    )
+    group.add_argument(
+        "--other-allele", type=str, metavar="OTHER_ALLELE", default="",
+        help="Reference/non-coded/other allele to be used when computing "
+             "dataset specific significance."
+    )
+    group.add_argument(
+        "--effect-allele", type=str, metavar="EFFECT_ALLELE", default="",
+        help="Reference/non-coded/other allele to be used when computing "
+             "dataset specific significance."
     )
     group.add_argument(
         "--p-value", type=str, metavar="P", default="p", dest="p",
@@ -476,6 +629,12 @@ def parse_args():
         "--significant-color", type=str, default="#FF0000", metavar="COLOR",
         help="The color for points representing significant points. "
              "[%(default)s]",
+    )
+    group.add_argument(
+        "--show-dataset-specific-variants",
+        action="store_true",
+        help="Use a different color for variants that are significant in the "
+             "top only, bottom only or both datasets."
     )
 
     # Plot text and style
