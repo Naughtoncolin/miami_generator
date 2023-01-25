@@ -1,4 +1,5 @@
 #!/usr/bin/env python
+"""Create miami plots from two categories."""
 
 
 import sys
@@ -33,6 +34,7 @@ logger = logging.getLogger("miami_generator")
 
 
 def main():
+    """Create miami plots from two categories."""
     # Getting the arguments and options
     args = parse_args()
     check_args(args)
@@ -48,6 +50,7 @@ def main():
 
 
 def create_miami_plot(dfs, pos_max, rel_start, args):
+    """Create the Miami plot."""
     # Creating the figure and axe
     logger.info("Generating the miami plot")
     figure, axe = plt.subplots(
@@ -112,6 +115,7 @@ def create_miami_plot(dfs, pos_max, rel_start, args):
 
 
 def positive_ytick_labels(axe):
+    "Changing the Y labels to positive numbers."
     # Getting the current Y ticks
     yticks = axe.get_yticks()
 
@@ -130,6 +134,7 @@ def positive_ytick_labels(axe):
 
 
 def add_group_labels(up_label, down_label, fontsize, axe):
+    """Add the group name (label) in each subplot."""
     # Adding the group labels
     axe.text(
         x=0.01, y=0.99, s=f"{up_label}", ha="left", va="top",
@@ -142,6 +147,7 @@ def add_group_labels(up_label, down_label, fontsize, axe):
 
 
 def add_chromosome_labels(pos_max, rel_start, axe, args):
+    """Add the chromosome labels in the X axis."""
     # The ticks and labels
     xticks = []
     xticks_labels = []
@@ -162,6 +168,7 @@ def add_chromosome_labels(pos_max, rel_start, axe, args):
 
 
 def add_plot_boxes(pos_max, rel_start, axe, args):
+    """Add alternating boxes (to highlight chromosome boundaries)."""
     # Boxes goes to even chromosomes indexes because we want alternating colors
     # even between 23 and 25 (24 is mostly never analyzed)
     for chrom_i, chrom in enumerate(sorted(pos_max.keys())):
@@ -177,6 +184,7 @@ def add_plot_boxes(pos_max, rel_start, axe, args):
 
 
 def find_chrom_box_start_end(pos_max, rel_start, padding=0):
+    """Finds the chromosome box start."""
     relative_pos_min = rel_start - padding
     relative_pos_max = pos_max + rel_start + padding
 
@@ -184,6 +192,7 @@ def find_chrom_box_start_end(pos_max, rel_start, padding=0):
 
 
 def plot_group(df, rel_start, axe, args, up):
+    """Generate the scatter plot for a single group (each chromosome)."""
     if up:
         multiplier = -1
         colors = args.up_colors
@@ -222,6 +231,7 @@ def plot_group(df, rel_start, axe, args, up):
 def scatter_with_dataset_specific_significance(
     df, rel_start, axe, args, colors, multiplier, chrom, chrom_i
 ):
+    """Generate the scatter plot for a single group (specific significance)."""
     doing_dataset_1 = (multiplier == -1)
 
     markers = {
@@ -266,6 +276,7 @@ def scatter_with_dataset_specific_significance(
 
 def scatter_standard(df, rel_start, axe, args, colors, multiplier, chrom,
                      chrom_i):
+    """Generate the scatter plot for a single group."""
     # Plotting the normal points
     axe.scatter(
         df.loc[:, args.pos] + rel_start[chrom],
@@ -289,6 +300,7 @@ def scatter_standard(df, rel_start, axe, args, colors, multiplier, chrom,
 
 
 def find_chrom_relative_start(df1, df2, args):
+    """Find chromosome relative start (according to previous chromosome)."""
     # The biggest positions of all chromosome
     chrom_max = defaultdict(int)
 
@@ -321,6 +333,7 @@ def find_chrom_relative_start(df1, df2, args):
 
 
 def read_data(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
+    """Read the data file (splitting a single file in two if necessary)."""
     # The up and down dataset
     df_1 = None
     df_2 = None
@@ -447,6 +460,7 @@ def check_significance_in_datasets(
 
 
 def chrom_as_int(chrom):
+    """Convert string chromosome to integer."""
     if chrom == "X":
         return 23
     if chrom == "Y":
@@ -464,6 +478,7 @@ def chrom_as_int(chrom):
 
 
 def check_args(args):
+    """Verify arguments and options."""
     # Checking a single data file
     if args.data is not None:
         # No other dataset is specified
@@ -522,6 +537,7 @@ def check_args(args):
 
 
 def parse_args():
+    """Parse arguments and options."""
     parser = argparse.ArgumentParser(
         description="Creates a Miami plot from two datasets.",
     )
