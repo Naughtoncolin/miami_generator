@@ -162,8 +162,9 @@ def add_chromosome_labels(pos_max, rel_start, axe, args):
 
 
 def add_plot_boxes(pos_max, rel_start, axe, args):
-    # Boxes goes to even chromosomes
-    for chrom_i, chrom in enumerate(pos_max.keys()):
+    # Boxes goes to even chromosomes indexes because we want alternating colors
+    # even between 23 and 25 (24 is mostly never analyzed)
+    for chrom_i, chrom in enumerate(sorted(pos_max.keys())):
         if (chrom_i + 1) % 2 == 0:
             min_pos, max_pos = find_chrom_box_start_end(
                 pos_max[chrom], rel_start[chrom],
