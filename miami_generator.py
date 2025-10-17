@@ -149,12 +149,19 @@ def _sniff_separator(file_path: str, provided: Optional[str]) -> str:
     if provided:
         return provided
 
-    with open(file_path, "r", newline="") as handle:
+    with open(file_path, "r", newline="", encoding="utf-8") as handle:
         sample = handle.read(4096)
         handle.seek(0)
         try:
             dialect = csv.Sniffer().sniff(sample, delimiters=DEFAULT_DELIMITERS)
-            return dialect.delimiter
+            detected_separator = dialect.delimiter
+            
+            # Validate that the detected separator is a single-byte character
+            if len(detected_separator.encode('utf-8')) > 1:
+                logger.warning(f"Detected separator '{detected_separator}' is multi-byte, falling back to tab")
+                return "\t"
+            
+            return detected_separator
         except csv.Error:
             if "\t" in sample:
                 return "\t"
@@ -302,6 +309,7 @@ def load_dataset(
             file_path,
             separator=format_info.separator,
             columns=use_columns if use_columns else None,
+            encoding="utf-8",
         )
     except Exception as exc:
         logger.error(f"{file_path}: {exc}")
@@ -402,7 +410,7 @@ def create_miami_plot(dfs, pos_max, rel_start, args):
 
     # Changing the tick size for the Y axis
     for tick in axe.yaxis.get_major_ticks():
-        tick.label.set_fontsize(args.axis_text_size)
+        tick.label1.set_fontsize(args.axis_text_size)
 
     # Changing so that they are equal on both sides
     y_min, y_max = axe.get_ylim()
@@ -656,20 +664,18 @@ def scatter_standard(
         for value in df.get_column(args.p).to_list()
     ]
     axe.scatter(
-        df.loc[:, args.pos] + rel_start[chrom],
-        (np.log10(df.loc[:, args.p])) * multiplier,
+        df[args.pos] + rel_start[chrom],
+        (np.log10(df[args.p])) * multiplier,
         s=args.point_size,
         c=colors[0] if (chrom_i + 1) % 2 == 1 else colors[1],
         zorder=3,
     )
 
     # Plotting the significant points
-    sig_points = df.loc[
-        df.loc[:, args.p] < args.significant_threshold, :
-    ]
+    sig_points = df.filter(pl.col(args.p) < args.significant_threshold)
     axe.scatter(
-        sig_points.loc[:, args.pos] + rel_start[chrom],
-        (np.log10(sig_points.loc[:, args.p])) * multiplier,
+        sig_points[args.pos] + rel_start[chrom],
+        (np.log10(sig_points[args.p])) * multiplier,
         s=args.significant_point_size,
         c=args.significant_color,
         zorder=3,
@@ -737,6 +743,9 @@ def read_data(args) -> Tuple[pl.DataFrame, pl.DataFrame]:
     cols = [args.chrom, args.pos, args.p]
     if args.show_dataset_specific_variants:
         cols.extend([args.other_allele, args.effect_allele])
+    
+    # Determine the actual separator to use
+    actual_separator = separator_override if separator_override else "auto"
 
     # Dataset is in a single file
     if args.data is not None:
@@ -746,7 +755,19 @@ def read_data(args) -> Tuple[pl.DataFrame, pl.DataFrame]:
         # Reading the file
         df = None
         try:
-            df = pl.read_csv(args.data, separator=args.sep, columns=cols)
+            # Use the new load_dataset function for proper separator detection
+            df, format_info = load_dataset(
+                args.data,
+                overrides=overrides,
+                include_optional=optional_columns,
+                require_group=True,
+                provided_separator=separator_override,
+            )
+            # Set the column names in args for compatibility
+            args.chrom = "chrom"
+            args.pos = "pos"
+            args.p = "p"
+            args.strata = "group"
         except Exception as e:
             logger.error(f"{args.data}: {str(e)}")
             sys.exit(1)
@@ -776,7 +797,13 @@ def read_data(args) -> Tuple[pl.DataFrame, pl.DataFrame]:
         # Reading the first file
         logger.info(f"Reading '{args.up_data}'")
         try:
-            df_1 = pl.read_csv(args.up_data, separator=args.sep, columns=cols)
+            df_1, _ = load_dataset(
+                args.up_data,
+                overrides=overrides,
+                include_optional=optional_columns,
+                require_group=False,
+                provided_separator=separator_override,
+            )
         except Exception as e:
             logger.error(f"{args.up_data}: {str(e)}")
             sys.exit(1)
@@ -784,10 +811,21 @@ def read_data(args) -> Tuple[pl.DataFrame, pl.DataFrame]:
         # Reading the second file
         logger.info(f"Reading '{args.down_data}'")
         try:
-            df_2 = pl.read_csv(args.down_data, separator=args.sep, columns=cols)
+            df_2, _ = load_dataset(
+                args.down_data,
+                overrides=overrides,
+                include_optional=optional_columns,
+                require_group=False,
+                provided_separator=separator_override,
+            )
         except Exception as e:
-            logger.error(f"{args.up_data}: {str(e)}")
+            logger.error(f"{args.down_data}: {str(e)}")
             sys.exit(1)
+        
+        # Set the column names in args for compatibility
+        args.chrom = "chrom"
+        args.pos = "pos"
+        args.p = "p"
 
     return df_1, df_2
 
