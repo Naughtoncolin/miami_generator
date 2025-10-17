@@ -1,0 +1,5 @@
+Chromosome	Position	P_value	NEG_LOG10P	Category
+1	12345	1e-5	5.0	CohortA
+1	12350	1e-4	4.0	CohortB
+2	20000	0.2	0.69897	CohortA
+2	20010	0.03	1.5228787	CohortB
