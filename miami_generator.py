@@ -15,7 +15,6 @@ from os import path
 from collections import defaultdict
 
 import polars as pl
-import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 
@@ -281,7 +280,7 @@ def load_dataset(
     include_optional: Iterable[str],
     require_group: bool,
     provided_separator: Optional[str],
-) -> Tuple[pd.DataFrame, DatasetFormat]:
+) -> Tuple[pl.DataFrame, DatasetFormat]:
     """Load a dataset with automatically detected format information."""
 
     format_info = detect_dataset_format(
@@ -299,13 +298,12 @@ def load_dataset(
     ]
 
     try:
-        df = pd.read_csv(
+        df = pl.read_csv(
             file_path,
-            sep=format_info.separator,
-            low_memory=False,
-            usecols=use_columns if use_columns else None,
+            separator=format_info.separator,
+            columns=use_columns if use_columns else None,
         )
-    except ValueError as exc:
+    except Exception as exc:
         logger.error(f"{file_path}: {exc}")
         sys.exit(1)
 
@@ -314,22 +312,22 @@ def load_dataset(
         for canonical, original in format_info.column_map.items()
         if original is not None
     }
-    df = df.rename(columns=rename_map)
+    df = df.rename(rename_map)
 
     if "chrom" in df.columns:
-        df["chrom"] = df["chrom"].astype(str)
+        df = df.with_columns(pl.col("chrom").cast(pl.Utf8))
 
     if "pos" in df.columns:
-        df["pos"] = pd.to_numeric(df["pos"], errors="coerce")
-        if df["pos"].isnull().any():
+        df = df.with_columns(pl.col("pos").cast(pl.Float64, strict=False))
+        if df.select(pl.col("pos").is_null().any()).item():
             logger.error(f"{file_path}: non numeric positions detected")
             sys.exit(1)
 
     if "p" in df.columns:
-        df["p"] = pd.to_numeric(df["p"], errors="coerce")
+        df = df.with_columns(pl.col("p").cast(pl.Float64, strict=False))
 
     if "log10p" in df.columns:
-        df["log10p"] = pd.to_numeric(df["log10p"], errors="coerce")
+        df = df.with_columns(pl.col("log10p").cast(pl.Float64, strict=False))
 
     if "log10p" not in df.columns:
         if "p" not in df.columns:
@@ -337,20 +335,18 @@ def load_dataset(
                 f"{file_path}: unable to compute log10(p) without p-values"
             )
             sys.exit(1)
-        with np.errstate(divide="ignore"):
-            df["log10p"] = -np.log10(df["p"])
+        df = df.with_columns((-pl.col("p").log10()).alias("log10p"))
 
     if "p" not in df.columns:
-        with np.errstate(over="ignore"):
-            df["p"] = np.power(10.0, -df["log10p"])
+        df = df.with_columns(pl.lit(10.0).pow(-pl.col("log10p")).alias("p"))
 
     if "effect_allele" in df.columns:
-        df["effect_allele"] = df["effect_allele"].astype(str)
+        df = df.with_columns(pl.col("effect_allele").cast(pl.Utf8))
     if "other_allele" in df.columns:
-        df["other_allele"] = df["other_allele"].astype(str)
+        df = df.with_columns(pl.col("other_allele").cast(pl.Utf8))
 
     if require_group and "group" in df.columns:
-        df["group"] = df["group"].astype(str)
+        df = df.with_columns(pl.col("group").cast(pl.Utf8))
 
     return df, format_info
 
@@ -750,9 +746,8 @@ def read_data(args) -> Tuple[pl.DataFrame, pl.DataFrame]:
         # Reading the file
         df = None
         try:
-            df = pd.read_csv(args.data, sep=args.sep, low_memory=False,
-                             usecols=cols)
-        except ValueError as e:
+            df = pl.read_csv(args.data, separator=args.sep, columns=cols)
+        except Exception as e:
             logger.error(f"{args.data}: {str(e)}")
             sys.exit(1)
 
@@ -765,8 +760,8 @@ def read_data(args) -> Tuple[pl.DataFrame, pl.DataFrame]:
             sys.exit(1)
 
         # Splitting
-        df_1 = df.loc[df.loc[:, args.strata] == unique_group[0], :]
-        df_2 = df.loc[df.loc[:, args.strata] == unique_group[1], :]
+        df_1 = df.filter(pl.col(args.strata) == unique_group[0])
+        df_2 = df.filter(pl.col(args.strata) == unique_group[1])
 
         # Setting the label if not already set by the user
         if args.up_data_label is None:
@@ -781,18 +776,16 @@ def read_data(args) -> Tuple[pl.DataFrame, pl.DataFrame]:
         # Reading the first file
         logger.info(f"Reading '{args.up_data}'")
         try:
-            df_1 = pd.read_csv(args.up_data, sep=args.sep, low_memory=False,
-                               usecols=cols)
-        except ValueError as e:
+            df_1 = pl.read_csv(args.up_data, separator=args.sep, columns=cols)
+        except Exception as e:
             logger.error(f"{args.up_data}: {str(e)}")
             sys.exit(1)
 
         # Reading the second file
         logger.info(f"Reading '{args.down_data}'")
         try:
-            df_2 = pd.read_csv(args.down_data, sep=args.sep, low_memory=False,
-                               usecols=cols)
-        except ValueError as e:
+            df_2 = pl.read_csv(args.down_data, separator=args.sep, columns=cols)
+        except Exception as e:
             logger.error(f"{args.up_data}: {str(e)}")
             sys.exit(1)
 
