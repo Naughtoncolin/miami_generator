@@ -2,8 +2,11 @@
 """Create miami plots from two categories."""
 
 
+import csv
+import re
 import sys
-from typing import Tuple
+from dataclasses import dataclass
+from typing import Dict, Iterable, Optional, Tuple
 import logging
 import argparse
 from os import path
@@ -32,6 +35,312 @@ logging.basicConfig(
 )
 logger = logging.getLogger("miami_generator")
 
+
+DEFAULT_DELIMITERS = [",", "\t", ";", "|", " "]
+
+COLUMN_ALIASES: Dict[str, Iterable[str]] = {
+    "chrom": (
+        "chr",
+        "chrom",
+        "chromosome",
+        "chromosomeid",
+        "chromosome_name",
+        "chromosomecode",
+    ),
+    "pos": (
+        "pos",
+        "position",
+        "bp",
+        "basepair",
+        "base_pair",
+        "bp_position",
+        "bp_pos",
+        "bpcoordinate",
+        "pos_bp",
+        "position_bp",
+    ),
+    "p": (
+        "p",
+        "pvalue",
+        "p_value",
+        "pval",
+        "pval_nominal",
+        "pvalue_nominal",
+        "pvalueall",
+        "pvaluemeta",
+        "pvaluefixed",
+        "pvaluerandom",
+        "pvaluegc",
+    ),
+    "log10p": (
+        "log10p",
+        "log10pvalue",
+        "log10pval",
+        "logp",
+        "logpvalue",
+        "minuslog10p",
+        "minuslogp",
+        "neglog10p",
+        "neglogp",
+        "nlog10p",
+        "mlogp",
+        "mlog10p",
+        "neglog10",
+        "neglog",
+    ),
+    "effect_allele": (
+        "effect_allele",
+        "effectallele",
+        "allele1",
+        "a1",
+        "alt",
+        "alt_allele",
+        "ea",
+    ),
+    "other_allele": (
+        "other_allele",
+        "otherallele",
+        "allele2",
+        "a2",
+        "ref",
+        "ref_allele",
+        "oa",
+    ),
+    "group": (
+        "group",
+        "strata",
+        "cohort",
+        "dataset",
+        "category",
+        "phenotype",
+        "trait",
+        "label",
+    ),
+}
+
+
+@dataclass
+class DatasetFormat:
+    """Metadata describing how to read a dataset."""
+
+    separator: str
+    column_map: Dict[str, Optional[str]]
+    original_columns: Tuple[str, ...]
+
+
+def _normalize_column_name(name: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "", name.lower())
+
+
+def _sniff_separator(file_path: str, provided: Optional[str]) -> str:
+    """Detect the separator for a file."""
+
+    if provided:
+        return provided
+
+    with open(file_path, "r", newline="") as handle:
+        sample = handle.read(4096)
+        handle.seek(0)
+        try:
+            dialect = csv.Sniffer().sniff(sample, delimiters=DEFAULT_DELIMITERS)
+            return dialect.delimiter
+        except csv.Error:
+            if "\t" in sample:
+                return "\t"
+            if "," in sample:
+                return ","
+            return "\t"
+
+
+def _build_column_overrides(args) -> Dict[str, Optional[str]]:
+    """Capture user requested column names before detection mutates args."""
+
+    overrides = {
+        "chrom": getattr(args, "chrom", None),
+        "pos": getattr(args, "pos", None),
+        "p": getattr(args, "p", None),
+        "log10p": getattr(args, "logp", None),
+        "other_allele": getattr(args, "other_allele", None),
+        "effect_allele": getattr(args, "effect_allele", None),
+        "group": getattr(args, "strata", None),
+    }
+
+    return {key: value for key, value in overrides.items() if value}
+
+
+def _find_matching_column(header: Iterable[str], canonical: str) -> Optional[str]:
+    aliases = set(COLUMN_ALIASES.get(canonical, [])) | {canonical}
+    normalized_aliases = {_normalize_column_name(alias) for alias in aliases}
+
+    for col in header:
+        if _normalize_column_name(col) in normalized_aliases:
+            return col
+    return None
+
+
+def detect_dataset_format(
+    file_path: str,
+    overrides: Dict[str, str],
+    include_optional: Iterable[str],
+    require_group: bool,
+    provided_separator: Optional[str],
+) -> DatasetFormat:
+    """Detect the dataset separator and relevant column names."""
+
+    separator = _sniff_separator(file_path, provided_separator)
+
+    with open(file_path, "r", newline="") as handle:
+        reader = csv.reader(handle, delimiter=separator)
+        try:
+            header = next(reader)
+        except StopIteration:
+            logger.error(f"{file_path}: file is empty")
+            sys.exit(1)
+
+    header = [column.strip() for column in header]
+    column_map: Dict[str, Optional[str]] = {}
+    required = ["chrom", "pos"]
+    optional = {"p", "log10p"}
+    optional.update(include_optional)
+    if require_group or "group" in overrides:
+        optional.add("group")
+
+    used_columns = set()
+
+    def _assign_column(canonical: str, column: Optional[str]):
+        if column is not None:
+            column_map[canonical] = column
+            used_columns.add(column)
+        else:
+            column_map[canonical] = None
+
+    # First honour overrides.
+    for canonical, column in overrides.items():
+        if canonical not in required and canonical not in optional:
+            optional.add(canonical)
+        if column not in header:
+            logger.error(f"{file_path}: column '{column}' not found")
+            sys.exit(1)
+        _assign_column(canonical, column)
+
+    # Detect required columns.
+    for canonical in required + sorted(optional):
+        if canonical in column_map and column_map[canonical] is not None:
+            continue
+        match = _find_matching_column(header, canonical)
+        if match and match not in used_columns:
+            _assign_column(canonical, match)
+        else:
+            _assign_column(canonical, None)
+
+    if column_map["chrom"] is None or column_map["pos"] is None:
+        logger.error(
+            f"{file_path}: unable to detect chromosome and position columns"
+        )
+        sys.exit(1)
+
+    if column_map.get("p") is None and column_map.get("log10p") is None:
+        logger.error(
+            f"{file_path}: unable to detect either a p-value or log10(p) column"
+        )
+        sys.exit(1)
+
+    for canonical in include_optional:
+        if column_map.get(canonical) is None:
+            logger.error(
+                f"{file_path}: unable to detect required column '{canonical}'"
+            )
+            sys.exit(1)
+
+    if require_group and column_map.get("group") is None:
+        logger.error(f"{file_path}: unable to detect grouping column")
+        sys.exit(1)
+
+    return DatasetFormat(
+        separator=separator,
+        column_map=column_map,
+        original_columns=tuple(header),
+    )
+
+
+def load_dataset(
+    file_path: str,
+    overrides: Dict[str, str],
+    include_optional: Iterable[str],
+    require_group: bool,
+    provided_separator: Optional[str],
+) -> Tuple[pd.DataFrame, DatasetFormat]:
+    """Load a dataset with automatically detected format information."""
+
+    format_info = detect_dataset_format(
+        file_path,
+        overrides=overrides,
+        include_optional=include_optional,
+        require_group=require_group,
+        provided_separator=provided_separator,
+    )
+
+    use_columns = [
+        column
+        for column in format_info.column_map.values()
+        if column is not None
+    ]
+
+    try:
+        df = pd.read_csv(
+            file_path,
+            sep=format_info.separator,
+            low_memory=False,
+            usecols=use_columns if use_columns else None,
+        )
+    except ValueError as exc:
+        logger.error(f"{file_path}: {exc}")
+        sys.exit(1)
+
+    rename_map = {
+        original: canonical
+        for canonical, original in format_info.column_map.items()
+        if original is not None
+    }
+    df = df.rename(columns=rename_map)
+
+    if "chrom" in df.columns:
+        df["chrom"] = df["chrom"].astype(str)
+
+    if "pos" in df.columns:
+        df["pos"] = pd.to_numeric(df["pos"], errors="coerce")
+        if df["pos"].isnull().any():
+            logger.error(f"{file_path}: non numeric positions detected")
+            sys.exit(1)
+
+    if "p" in df.columns:
+        df["p"] = pd.to_numeric(df["p"], errors="coerce")
+
+    if "log10p" in df.columns:
+        df["log10p"] = pd.to_numeric(df["log10p"], errors="coerce")
+
+    if "log10p" not in df.columns:
+        if "p" not in df.columns:
+            logger.error(
+                f"{file_path}: unable to compute log10(p) without p-values"
+            )
+            sys.exit(1)
+        with np.errstate(divide="ignore"):
+            df["log10p"] = -np.log10(df["p"])
+
+    if "p" not in df.columns:
+        with np.errstate(over="ignore"):
+            df["p"] = np.power(10.0, -df["log10p"])
+
+    if "effect_allele" in df.columns:
+        df["effect_allele"] = df["effect_allele"].astype(str)
+    if "other_allele" in df.columns:
+        df["other_allele"] = df["other_allele"].astype(str)
+
+    if require_group and "group" in df.columns:
+        df["group"] = df["group"].astype(str)
+
+    return df, format_info
 
 def main():
     """Create miami plots from two categories."""
@@ -266,7 +575,7 @@ def scatter_with_dataset_specific_significance(
         cur = df.loc[df.significance == level, :]
         axe.scatter(
             cur[args.pos] + rel_start[chrom],
-            (np.log10(cur[args.p])) * multiplier,
+            cur[args.logp] * (-multiplier),
             s=s,
             marker=marker,
             c=color,
@@ -280,7 +589,7 @@ def scatter_standard(df, rel_start, axe, args, colors, multiplier, chrom,
     # Plotting the normal points
     axe.scatter(
         df.loc[:, args.pos] + rel_start[chrom],
-        (np.log10(df.loc[:, args.p])) * multiplier,
+        df.loc[:, args.logp] * (-multiplier),
         s=args.point_size,
         c=colors[0] if (chrom_i + 1) % 2 == 1 else colors[1],
         zorder=3,
@@ -292,7 +601,7 @@ def scatter_standard(df, rel_start, axe, args, colors, multiplier, chrom,
     ]
     axe.scatter(
         sig_points.loc[:, args.pos] + rel_start[chrom],
-        (np.log10(sig_points.loc[:, args.p])) * multiplier,
+        sig_points.loc[:, args.logp] * (-multiplier),
         s=args.significant_point_size,
         c=args.significant_color,
         zorder=3,
@@ -334,40 +643,46 @@ def find_chrom_relative_start(df1, df2, args):
 
 def read_data(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
     """Read the data file (splitting a single file in two if necessary)."""
-    # The up and down dataset
-    df_1 = None
-    df_2 = None
 
-    # The column to read (to speed up the IO)
-    cols = [args.chrom, args.pos, args.p]
+    separator_override = None
+    if getattr(args, "sep", None) not in (None, "auto"):
+        separator_override = args.sep
+
+    overrides = _build_column_overrides(args)
+    optional_columns = []
     if args.show_dataset_specific_variants:
-        cols.extend([args.other_allele, args.effect_allele])
+        optional_columns.extend(["other_allele", "effect_allele"])
+
+    args.logp = "log10p"
 
     # Dataset is in a single file
     if args.data is not None:
-        # We need the group column
         logger.info(f"Reading '{args.data}'")
-        cols.append(args.strata)
 
-        # Reading the file
-        df = None
-        try:
-            df = pd.read_csv(args.data, sep=args.sep, low_memory=False,
-                             usecols=cols)
-        except ValueError as e:
-            logger.error(f"{args.data}: {str(e)}")
-            sys.exit(1)
+        df, _ = load_dataset(
+            args.data,
+            overrides=overrides,
+            include_optional=optional_columns,
+            require_group=True,
+            provided_separator=separator_override,
+        )
+
+        args.chrom = "chrom"
+        args.pos = "pos"
+        args.p = "p"
+        args.strata = "group"
 
         # Checking the number of group
         unique_group = df.loc[:, args.strata].unique()
         if len(unique_group) != 2:
-            logger.error(f"{args.data}: need exactly two groups "
-                         f"'{args.strata}'")
+            logger.error(
+                f"{args.data}: need exactly two groups '{args.strata}'"
+            )
             sys.exit(1)
 
         # Splitting
-        df_1 = df.loc[df.loc[:, args.strata] == unique_group[0], :]
-        df_2 = df.loc[df.loc[:, args.strata] == unique_group[1], :]
+        df_1 = df.loc[df.loc[:, args.strata] == unique_group[0], :].copy()
+        df_2 = df.loc[df.loc[:, args.strata] == unique_group[1], :].copy()
 
         # Setting the label if not already set by the user
         if args.up_data_label is None:
@@ -375,25 +690,51 @@ def read_data(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
         if args.down_data_label is None:
             args.down_data_label = unique_group[1]
 
+        return df_1, df_2
+
     # There are two datasets
-    else:
-        # Reading the first file
-        logger.info(f"Reading '{args.up_data}'")
-        try:
-            df_1 = pd.read_csv(args.up_data, sep=args.sep, low_memory=False,
-                               usecols=cols)
-        except ValueError as e:
-            logger.error(f"{args.up_data}: {str(e)}")
+    logger.info(f"Reading '{args.up_data}'")
+    df_1, _ = load_dataset(
+        args.up_data,
+        overrides=overrides,
+        include_optional=optional_columns,
+        require_group=False,
+        provided_separator=separator_override,
+    )
+
+    logger.info(f"Reading '{args.down_data}'")
+    df_2, _ = load_dataset(
+        args.down_data,
+        overrides=overrides,
+        include_optional=optional_columns,
+        require_group=False,
+        provided_separator=separator_override,
+    )
+
+    args.chrom = "chrom"
+    args.pos = "pos"
+    args.p = "p"
+
+    if args.show_dataset_specific_variants:
+        missing_columns = []
+        for column in ["other_allele", "effect_allele"]:
+            if column not in df_1.columns or column not in df_2.columns:
+                missing_columns.append(column)
+        if missing_columns:
+            logger.error(
+                "Missing columns in dataset specific variant detection: "
+                + ", ".join(missing_columns)
+            )
             sys.exit(1)
 
-        # Reading the second file
-        logger.info(f"Reading '{args.down_data}'")
-        try:
-            df_2 = pd.read_csv(args.down_data, sep=args.sep, low_memory=False,
-                               usecols=cols)
-        except ValueError as e:
-            logger.error(f"{args.up_data}: {str(e)}")
-            sys.exit(1)
+    # Ensure both datasets contain the same set of columns
+    if set(df_1.columns) != set(df_2.columns):
+        diff = sorted(set(df_1.columns).symmetric_difference(set(df_2.columns)))
+        logger.error(
+            "Input files must contain matching columns. Mismatched columns: "
+            + ", ".join(diff)
+        )
+        sys.exit(1)
 
     return df_1, df_2
 
@@ -430,8 +771,8 @@ def check_significance_in_datasets(
     df2["_id"] = _create_id(df2)
 
     # Compute -log10(p) for both datasets.
-    df1["nlogp_1"] = -np.log10(df1[args.p])
-    df2["nlogp_2"] = -np.log10(df2[args.p])
+    df1["nlogp_1"] = df1[args.logp]
+    df2["nlogp_2"] = df2[args.logp]
 
     merged = pd.merge(df1, df2, how="outer", on="_id")
 
@@ -523,24 +864,13 @@ def check_args(args):
     elif args.significant_threshold not in args.abline:
         args.abline.append(args.significant_threshold)
 
-    # Check that both alleles are provided if show_dataset_specific_variants
-    # is requested.
-    if args.show_dataset_specific_variants:
-        if args.other_allele == "" or args.effect_allele == "":
-            logger.error(
-                "Need to provide columns for alleles (--effect-allele and "
-                "--other-allele) when the --show-dataset-specific-variants "
-                "option is enabled. This is needed to ensure that the same "
-                "variants (same alleles) are compared across both datasets."
-            )
-            sys.exit(1)
 
-
-def parse_args():
+def parse_args(argv=None):
     """Parse arguments and options."""
     parser = argparse.ArgumentParser(
         description="Creates a Miami plot from two datasets.",
     )
+    parser.set_defaults(logp=None)
 
     # The input files
     group = parser.add_argument_group("Input options")
@@ -574,16 +904,17 @@ def parse_args():
     # The columns to gather information
     group = parser.add_argument_group("Data format")
     group.add_argument(
-        "--separator", type=str, metavar="SEP", default="\t", dest="sep",
-        help="The file(s) field separator. [TAB]",
+        "--separator", type=str, metavar="SEP", default="auto", dest="sep",
+        help="The file(s) field separator. Automatically detected when set to"
+             " 'auto'. [%(default)s]",
     )
     group.add_argument(
-        "--chromosome", type=str, metavar="CHR", default="chr", dest="chrom",
-        help="The column containing the chromosomes. [%(default)s]",
+        "--chromosome", type=str, metavar="CHR", default=None, dest="chrom",
+        help="The column containing the chromosomes. [auto]",
     )
     group.add_argument(
-        "--position", type=str, metavar="POS", default="pos", dest="pos",
-        help="The column containing the positions. [%(default)s]",
+        "--position", type=str, metavar="POS", default=None, dest="pos",
+        help="The column containing the positions. [auto]",
     )
     group.add_argument(
         "--other-allele", type=str, metavar="OTHER_ALLELE", default="",
@@ -596,8 +927,8 @@ def parse_args():
              "dataset specific significance."
     )
     group.add_argument(
-        "--p-value", type=str, metavar="P", default="p", dest="p",
-        help="The column containing the p-values. [%(default)s]",
+        "--p-value", type=str, metavar="P", default=None, dest="p",
+        help="The column containing the p-values. [auto]",
     )
     group.add_argument(
         "--group", type=str, metavar="COL", dest="strata",
@@ -736,7 +1067,7 @@ def parse_args():
              "[%(default).1f]",
     )
 
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 if __name__ == "__main__":
