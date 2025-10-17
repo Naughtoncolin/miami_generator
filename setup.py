@@ -26,7 +26,7 @@ def setup_package():
         },
         py_modules=["miami_generator"],
         install_requires=[
-            "matplotlib>=2.0,<3.2",
+            "matplotlib>=3.0",
             "polars>=0.19",
         ],
         classifiers=[
