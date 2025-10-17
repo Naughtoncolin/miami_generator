@@ -3,14 +3,15 @@
 
 
 import sys
+import math
+import random
 from typing import Tuple
 import logging
 import argparse
 from os import path
 from collections import defaultdict
 
-import numpy as np
-import pandas as pd
+import polars as pl
 import matplotlib.pyplot as plt
 
 
@@ -31,6 +32,15 @@ logging.basicConfig(
     datefmt="%Y-%m-%d %H:%M:%S",
 )
 logger = logging.getLogger("miami_generator")
+
+
+def safe_log10(value: float) -> float:
+    """Return log10 handling values that would cause math domain errors."""
+    if value is None:
+        return float("nan")
+    if value <= 0:
+        return float("-inf")
+    return math.log10(value)
 
 
 def main():
@@ -97,7 +107,7 @@ def create_miami_plot(dfs, pos_max, rel_start, args):
 
     # Creating the ablines
     for abline in args.abline:
-        abline = -np.log10(abline)
+        abline = -safe_log10(abline)
         if abline <= final_y:
             axe.axhline(y=abline, color="black", ls="--", lw=1, zorder=2)
             axe.axhline(y=-abline, color="black", ls="--", lw=1, zorder=2)
@@ -200,39 +210,75 @@ def plot_group(df, rel_start, axe, args, up):
         multiplier = 1
         colors = args.down_colors
 
-    # Plotting per chromosome
-    for chrom_i, (chrom, df) in enumerate(df.groupby(args.chrom, sort=True)):
-        # Encoding the chromosome
-        chrom = chrom_as_int(chrom)
+    chrom_values = (
+        df.select(pl.col(args.chrom))
+        .unique()
+        .to_series()
+        .to_list()
+    )
+    chrom_values.sort(key=chrom_as_int)
 
-        # Sorting by positions
-        df = df.sort_values(args.pos)
+    for chrom_i, chrom_value in enumerate(chrom_values):
+        chrom = chrom_as_int(chrom_value)
+        chrom_df = (
+            df.filter(pl.col(args.chrom) == chrom_value)
+            .sort(args.pos)
+            .filter(pl.col(args.p) < args.max_p_value)
+        )
 
-        # Removing points with to high of a p-value
-        df = df.loc[df.loc[:, args.p] < args.max_p_value, :]
+        if chrom_df.is_empty():
+            continue
 
-        # Sampling the data
-        if args.p_value_sampling:
-            df = df.loc[
-                (df.loc[:, args.p] < args.p_sampling_t) |
-                (np.random.random(size=df.shape[0]) < args.p_sampling_prop), :
-            ]
+        if args.p_value_sampling and chrom_df.height:
+            random_values = [random.random() for _ in range(chrom_df.height)]
+            chrom_df = (
+                chrom_df.with_columns(pl.Series("_rand", random_values))
+                .filter(
+                    (pl.col(args.p) < args.p_sampling_t)
+                    | (pl.col("_rand") < args.p_sampling_prop)
+                )
+                .drop("_rand")
+            )
+
+        if chrom_df.is_empty():
+            continue
 
         if args.show_dataset_specific_variants:
             scatter_with_dataset_specific_significance(
-                df, rel_start, axe, args, colors, multiplier, chrom, chrom_i
+                chrom_df,
+                rel_start,
+                axe,
+                args,
+                colors,
+                multiplier,
+                chrom,
+                chrom_i,
             )
         else:
             scatter_standard(
-                df, rel_start, axe, args, colors, multiplier, chrom, chrom_i
+                chrom_df,
+                rel_start,
+                axe,
+                args,
+                colors,
+                multiplier,
+                chrom,
+                chrom_i,
             )
 
 
 def scatter_with_dataset_specific_significance(
-    df, rel_start, axe, args, colors, multiplier, chrom, chrom_i
+    df: pl.DataFrame,
+    rel_start,
+    axe,
+    args,
+    colors,
+    multiplier,
+    chrom,
+    chrom_i,
 ):
     """Generate the scatter plot for a single group (specific significance)."""
-    doing_dataset_1 = (multiplier == -1)
+    doing_dataset_1 = multiplier == -1
 
     markers = {
         "NON_SIGNIFICANT": "o",
@@ -244,18 +290,16 @@ def scatter_with_dataset_specific_significance(
     for level, marker in markers.items():
         color = colors[0] if (chrom_i + 1) % 2 == 1 else colors[1]
 
-        if (level == "NON_SIGNIFICANT"):
+        if level == "NON_SIGNIFICANT":
             # The variant is not significant anywhere, we use default color and
             # size.
             s = args.point_size
 
         elif (
-            ((doing_dataset_1) and level == "2_ONLY") or
-            ((not doing_dataset_1) and level == "1_ONLY")
+            (doing_dataset_1 and level == "2_ONLY")
+            or ((not doing_dataset_1) and level == "1_ONLY")
         ):
-            # The is significant in the other dataset only.
-            # We use the regular color, but still make the marker larger to
-            # make sure that it is visible.
+            # The variant is significant in the other dataset only.
             s = args.significant_point_size
 
         else:
@@ -263,10 +307,21 @@ def scatter_with_dataset_specific_significance(
             s = args.significant_point_size
             color = args.significant_color
 
-        cur = df.loc[df.significance == level, :]
+        cur = df.filter(pl.col("significance") == level)
+        if cur.is_empty():
+            continue
+
+        positions = [
+            value + rel_start[chrom]
+            for value in cur.get_column(args.pos).to_list()
+        ]
+        log_values = [
+            safe_log10(value) * multiplier
+            for value in cur.get_column(args.p).to_list()
+        ]
         axe.scatter(
-            cur[args.pos] + rel_start[chrom],
-            (np.log10(cur[args.p])) * multiplier,
+            positions,
+            log_values,
             s=s,
             marker=marker,
             c=color,
@@ -274,29 +329,51 @@ def scatter_with_dataset_specific_significance(
         )
 
 
-def scatter_standard(df, rel_start, axe, args, colors, multiplier, chrom,
-                     chrom_i):
+def scatter_standard(
+    df: pl.DataFrame,
+    rel_start,
+    axe,
+    args,
+    colors,
+    multiplier,
+    chrom,
+    chrom_i,
+):
     """Generate the scatter plot for a single group."""
-    # Plotting the normal points
+    positions = [
+        value + rel_start[chrom]
+        for value in df.get_column(args.pos).to_list()
+    ]
+    log_values = [
+        safe_log10(value) * multiplier
+        for value in df.get_column(args.p).to_list()
+    ]
     axe.scatter(
-        df.loc[:, args.pos] + rel_start[chrom],
-        (np.log10(df.loc[:, args.p])) * multiplier,
+        positions,
+        log_values,
         s=args.point_size,
         c=colors[0] if (chrom_i + 1) % 2 == 1 else colors[1],
         zorder=3,
     )
 
     # Plotting the significant points
-    sig_points = df.loc[
-        df.loc[:, args.p] < args.significant_threshold, :
-    ]
-    axe.scatter(
-        sig_points.loc[:, args.pos] + rel_start[chrom],
-        (np.log10(sig_points.loc[:, args.p])) * multiplier,
-        s=args.significant_point_size,
-        c=args.significant_color,
-        zorder=3,
-    )
+    sig_points = df.filter(pl.col(args.p) < args.significant_threshold)
+    if not sig_points.is_empty():
+        sig_positions = [
+            value + rel_start[chrom]
+            for value in sig_points.get_column(args.pos).to_list()
+        ]
+        sig_logs = [
+            safe_log10(value) * multiplier
+            for value in sig_points.get_column(args.p).to_list()
+        ]
+        axe.scatter(
+            sig_positions,
+            sig_logs,
+            s=args.significant_point_size,
+            c=args.significant_color,
+            zorder=3,
+        )
 
 
 def find_chrom_relative_start(df1, df2, args):
@@ -305,14 +382,24 @@ def find_chrom_relative_start(df1, df2, args):
     chrom_max = defaultdict(int)
 
     # The first data set
-    for chrom, df in df1.groupby(args.chrom, sort=True):
-        chrom = chrom_as_int(chrom)
-        chrom_max[chrom] = df.loc[:, args.pos].max()
+    if df1 is not None:
+        grouped_df1 = (
+            df1.group_by(args.chrom, maintain_order=True)
+            .agg(pl.col(args.pos).max().alias("max_pos"))
+        )
+        for chrom_value, max_pos in grouped_df1.iter_rows():
+            chrom = chrom_as_int(chrom_value)
+            chrom_max[chrom] = max(chrom_max[chrom], max_pos)
 
     # The second data set
-    for chrom, df in df2.groupby(args.chrom, sort=True):
-        chrom = chrom_as_int(chrom)
-        chrom_max[chrom] = max(chrom_max[chrom], df.loc[:, args.pos].max())
+    if df2 is not None:
+        grouped_df2 = (
+            df2.group_by(args.chrom, maintain_order=True)
+            .agg(pl.col(args.pos).max().alias("max_pos"))
+        )
+        for chrom_value, max_pos in grouped_df2.iter_rows():
+            chrom = chrom_as_int(chrom_value)
+            chrom_max[chrom] = max(chrom_max[chrom], max_pos)
 
     # Computing the relative starting position
     relative_start = {1: 0}
@@ -332,7 +419,7 @@ def find_chrom_relative_start(df1, df2, args):
     return chrom_max, relative_start
 
 
-def read_data(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
+def read_data(args) -> Tuple[pl.DataFrame, pl.DataFrame]:
     """Read the data file (splitting a single file in two if necessary)."""
     # The up and down dataset
     df_1 = None
@@ -350,24 +437,22 @@ def read_data(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
         cols.append(args.strata)
 
         # Reading the file
-        df = None
         try:
-            df = pd.read_csv(args.data, sep=args.sep, low_memory=False,
-                             usecols=cols)
+            df = pl.read_csv(args.data, separator=args.sep, columns=cols)
         except ValueError as e:
             logger.error(f"{args.data}: {str(e)}")
             sys.exit(1)
 
         # Checking the number of group
-        unique_group = df.loc[:, args.strata].unique()
+        unique_group = df.select(args.strata).unique().to_series().to_list()
         if len(unique_group) != 2:
             logger.error(f"{args.data}: need exactly two groups "
                          f"'{args.strata}'")
             sys.exit(1)
 
         # Splitting
-        df_1 = df.loc[df.loc[:, args.strata] == unique_group[0], :]
-        df_2 = df.loc[df.loc[:, args.strata] == unique_group[1], :]
+        df_1 = df.filter(pl.col(args.strata) == unique_group[0])
+        df_2 = df.filter(pl.col(args.strata) == unique_group[1])
 
         # Setting the label if not already set by the user
         if args.up_data_label is None:
@@ -380,8 +465,7 @@ def read_data(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
         # Reading the first file
         logger.info(f"Reading '{args.up_data}'")
         try:
-            df_1 = pd.read_csv(args.up_data, sep=args.sep, low_memory=False,
-                               usecols=cols)
+            df_1 = pl.read_csv(args.up_data, separator=args.sep, columns=cols)
         except ValueError as e:
             logger.error(f"{args.up_data}: {str(e)}")
             sys.exit(1)
@@ -389,8 +473,9 @@ def read_data(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
         # Reading the second file
         logger.info(f"Reading '{args.down_data}'")
         try:
-            df_2 = pd.read_csv(args.down_data, sep=args.sep, low_memory=False,
-                               usecols=cols)
+            df_2 = pl.read_csv(
+                args.down_data, separator=args.sep, columns=cols
+            )
         except ValueError as e:
             logger.error(f"{args.up_data}: {str(e)}")
             sys.exit(1)
@@ -399,10 +484,10 @@ def read_data(args) -> Tuple[pd.DataFrame, pd.DataFrame]:
 
 
 def check_significance_in_datasets(
-    df1,
-    df2,
+    df1: pl.DataFrame,
+    df2: pl.DataFrame,
     args
-) -> Tuple[pd.DataFrame, pd.DataFrame]:
+) -> Tuple[pl.DataFrame, pl.DataFrame]:
     """Checks significance of variants in the two datasets after joining.
 
     The returned series contains factors with levels:
@@ -412,51 +497,76 @@ def check_significance_in_datasets(
         - NON_SIGNIFICANT
 
     """
-    # Create unique identifiers for variants to allow joining.
-    def _create_id(df) -> pd.Series:
-        alleles_df = df[[args.other_allele, args.effect_allele]]\
-            .astype(str)
 
+    def _add_variant_id(df: pl.DataFrame) -> pl.DataFrame:
         return (
-            df[args.chrom].astype(str) + ":" +
-            df[args.pos].astype(str) + "_" +
-            alleles_df.min(axis=1) + "/" +
-            alleles_df.max(axis=1)
+            df.with_columns(
+                [
+                    pl.min_horizontal(
+                        [
+                            pl.col(args.other_allele).cast(str),
+                            pl.col(args.effect_allele).cast(str),
+                        ]
+                    ).alias("_allele_min"),
+                    pl.max_horizontal(
+                        [
+                            pl.col(args.other_allele).cast(str),
+                            pl.col(args.effect_allele).cast(str),
+                        ]
+                    ).alias("_allele_max"),
+                ]
+            )
+            .with_columns(
+                pl.concat_str(
+                    [
+                        pl.col(args.chrom).cast(str),
+                        pl.lit(":"),
+                        pl.col(args.pos).cast(str),
+                        pl.lit("_"),
+                        pl.col("_allele_min"),
+                        pl.lit("/"),
+                        pl.col("_allele_max"),
+                    ]
+                ).alias("_id")
+            )
+            .drop(["_allele_min", "_allele_max"])
         )
 
-    threshold = -np.log10(args.significant_threshold)
+    threshold = -safe_log10(args.significant_threshold)
 
-    df1["_id"] = _create_id(df1)
-    df2["_id"] = _create_id(df2)
+    df1_with_id = _add_variant_id(df1)
+    df2_with_id = _add_variant_id(df2)
 
-    # Compute -log10(p) for both datasets.
-    df1["nlogp_1"] = -np.log10(df1[args.p])
-    df2["nlogp_2"] = -np.log10(df2[args.p])
-
-    merged = pd.merge(df1, df2, how="outer", on="_id")
-
-    # Check the different possible types of significance.
-    sig_1 = merged.nlogp_1 > threshold
-    sig_2 = merged.nlogp_2 > threshold
-    sig_both = sig_1 & sig_2
-    sig_1_only = sig_1 & (~sig_2)
-    sig_2_only = sig_2 & (~sig_1)
-    ns = (~sig_1) & (~sig_2)
-
-    significance_df = pd.DataFrame({
-        "BOTH": sig_both,
-        "1_ONLY": sig_1_only,
-        "2_ONLY": sig_2_only,
-        "NON_SIGNIFICANT": ns
-    })
-
-    merged["significance"] = significance_df.idxmax(axis=1).astype("category")
-    merged = merged[["_id", "significance"]]
-
-    return (
-        pd.merge(df1, merged, how="left", on="_id"),
-        pd.merge(df2, merged, how="left", on="_id"),
+    df1_sig = df1_with_id.select(
+        ["_id", (-pl.col(args.p).log10()).alias("nlogp_1")]
     )
+    df2_sig = df2_with_id.select(
+        ["_id", (-pl.col(args.p).log10()).alias("nlogp_2")]
+    )
+
+    merged = df1_sig.join(df2_sig, on="_id", how="outer")
+    merged = merged.with_columns(
+        [
+            pl.col("nlogp_1").gt(threshold).fill_null(False).alias("sig_1"),
+            pl.col("nlogp_2").gt(threshold).fill_null(False).alias("sig_2"),
+        ]
+    )
+    merged = merged.with_columns(
+        pl.when(pl.col("sig_1") & pl.col("sig_2"))
+        .then("BOTH")
+        .when(pl.col("sig_1"))
+        .then("1_ONLY")
+        .when(pl.col("sig_2"))
+        .then("2_ONLY")
+        .otherwise("NON_SIGNIFICANT")
+        .alias("significance")
+    )
+    merged = merged.select(["_id", "significance"])
+
+    df1_result = df1_with_id.join(merged, on="_id", how="left")
+    df2_result = df2_with_id.join(merged, on="_id", how="left")
+
+    return df1_result.drop("_id"), df2_result.drop("_id")
 
 
 def chrom_as_int(chrom):
@@ -472,7 +582,7 @@ def chrom_as_int(chrom):
 
     try:
         return int(chrom)
-    except ValueError():
+    except ValueError:
         logger.error(f"{chrom}: invalid chromosome")
         sys.exit(1)
 

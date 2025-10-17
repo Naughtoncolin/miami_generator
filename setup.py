@@ -27,8 +27,7 @@ def setup_package():
         py_modules=["miami_generator"],
         install_requires=[
             "matplotlib>=2.0,<3.2",
-            "numpy>=1.14",
-            "pandas>=0.18",
+            "polars>=0.19",
         ],
         classifiers=[
             "Intended Audience :: Science/Research",
