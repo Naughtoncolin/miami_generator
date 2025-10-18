@@ -69,6 +69,7 @@ COLUMN_ALIASES: Dict[str, Iterable[str]] = {
         "bpcoordinate",
         "pos_bp",
         "position_bp",
+        "genpos",
     ),
     "p": (
         "p",
